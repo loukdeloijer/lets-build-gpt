@@ -8,9 +8,9 @@ import torch.nn.functional as F
 # parameters
 batch_size = 32 # how many independent sequences will we process in parallel?
 block_size = 8 # what is the maximum context length for predictions?
-max_iters = 3000
-eval_interval = 300
-learning_rate = 1e-2
+max_iters = 5000
+eval_interval = 500
+learning_rate = 1e-3
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
@@ -88,6 +88,14 @@ class Head(nn.Module):
         out = wei @ v # (B,T,T) @ (B,T,head_size) -> (B,T,head_size)
         return out
 
+class MultiHeadAttention(nn.Module):
+
+    def __init__(self, num_heads, head_size) -> None:
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+
+    def forward(self, x):
+        return torch.cat([h(x) for h in self.heads], dim=-1)
 
 class BigramLanguageModel(nn.Module):
 
@@ -95,7 +103,7 @@ class BigramLanguageModel(nn.Module):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed) # ()
         self.position_embedding_table = nn.Embedding(block_size, n_embed)
-        self.sa_head = Head(n_embed)
+        self.sa_heads = MultiHeadAttention(4, n_embed//4)
         self.lm_head = nn.Linear(n_embed, vocab_size)
 
     def forward(self, idx, targets=None):
@@ -105,7 +113,7 @@ class BigramLanguageModel(nn.Module):
         tok_emb = self.token_embedding_table(idx) # (B,T,C)
         pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,C)
         x = tok_emb + pos_emb # (B,T,C)
-        x = self.sa_head(x) # (B,T,C)
+        x = self.sa_heads(x) # (B,T,C)
         logits = self.lm_head(x) # (B,T,vocab_size)
 
 
