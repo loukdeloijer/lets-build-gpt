@@ -95,6 +95,7 @@ class BigramLanguageModel(nn.Module):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embed) # ()
         self.position_embedding_table = nn.Embedding(block_size, n_embed)
+        self.sa_head = Head(n_embed)
         self.lm_head = nn.Linear(n_embed, vocab_size)
 
     def forward(self, idx, targets=None):
@@ -104,6 +105,7 @@ class BigramLanguageModel(nn.Module):
         tok_emb = self.token_embedding_table(idx) # (B,T,C)
         pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T,C)
         x = tok_emb + pos_emb # (B,T,C)
+        x = self.sa_head(x) # (B,T,C)
         logits = self.lm_head(x) # (B,T,vocab_size)
 
 
@@ -121,7 +123,7 @@ class BigramLanguageModel(nn.Module):
         # idx is (B, T) array of indices in the current context
         for _ in range(max_new_tokens):
             # get the predictions
-            idx_cond = idx if idx.size(1) <= block_size else idx[:, -block_size:] #adjustion from video
+            idx_cond = idx[:, -block_size:] # crop to the last block_size tokens
             logits, _ = self(idx_cond)
 
             # focus only on the last time step
