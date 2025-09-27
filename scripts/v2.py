@@ -1,5 +1,6 @@
 
 from types import CellType
+from typing import ForwardRef
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -62,6 +63,32 @@ def estimate_loss():
     model.train()
     return out
 
+class Head(nn.Module):
+
+    def __init__(self, head_size) -> None:
+        super().__init__()
+
+        self.key = nn.Linear(n_embed, head_size, bias=False)
+        self.query = nn.Linear(n_embed, head_size, bias=False)
+        self.value = nn.Linear(n_embed, head_size, bias=False)
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+
+    def forward(self, x):
+        B, T, C = x.shape
+        k = self.key(x)   # (B,T,head_size)
+        q = self.query(x) # (B,T,head_size)
+
+        # compute attention scores
+        wei = q @ k.transpose(-2, -1) * C**-0.5 # (B,T,head_size) @ (B, head_size, T) -> (B,T,T)
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B,T,T)
+        wei = F.softmax(wei, dim=-1) # (B,T,T)
+
+        v = self.value(x) # (B,T,head_size)
+
+        out = wei @ v # (B,T,T) @ (B,T,head_size) -> (B,T,head_size)
+        return out
+
+
 class BigramLanguageModel(nn.Module):
 
     def __init__(self, vocab_size):
@@ -94,7 +121,7 @@ class BigramLanguageModel(nn.Module):
         # idx is (B, T) array of indices in the current context
         for _ in range(max_new_tokens):
             # get the predictions
-            idx_cond = idx if idx.size(1) <= block_size else idx[:, -block_size:]
+            idx_cond = idx if idx.size(1) <= block_size else idx[:, -block_size:] #adjustion from video
             logits, _ = self(idx_cond)
 
             # focus only on the last time step
