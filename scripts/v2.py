@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import wandb
+
 # parameters
 batch_size = 64 # how many independent sequences will we process in parallel?
 block_size = 256 # what is the maximum context length for predictions?
@@ -17,6 +19,20 @@ n_head = 6
 n_layers = 6
 dropout = 0.2
 # ------------
+
+wandb.init(project="llm-from-scratch")
+wandb.config.update({
+    "batch_size": batch_size,
+    "block_size": block_size,
+    "max_iters": max_iters,
+    "eval_interval": eval_interval,
+    "learning_rate": learning_rate,
+    "n_embed": n_embed,
+    "n_head": n_head,
+    "n_layers": n_layers,
+    "dropout": dropout
+})
+
 
 torch.manual_seed(1337)
 
@@ -197,6 +213,7 @@ for iter in range(max_iters):
     if iter % eval_interval == 0 or iter == max_iters - 1:
         losses = estimate_loss()
         print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        wandb.log({"train_loss": losses['train'], "val_loss": losses['val']}, step=iter)
 
     xb, yb = get_batch('train')
 
