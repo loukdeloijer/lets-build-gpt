@@ -42,10 +42,13 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf')) # type: ignore
-        att = F.softmax(att, dim=-1)
-        y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf')) # type: ignore
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # FlashAttention
+
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
 
         # output projection
@@ -223,23 +226,23 @@ class DataloaderLite:
         print(f"1 epoch = {len(tokens) // (B*T)} batches")
 
         #state
-        self.current_positiion = 0
+        self.current_position = 0
 
     def next_batch(self):
         B, T = self.B, self.T
 
-        batch = self.tokens[self.current_positiion : self.current_positiion + self.B * self.T + 1]
+        batch = self.tokens[self.current_position : self.current_position + self.B * self.T + 1]
 
         x = batch[:-1].view(B, T)
         y = batch[1:].view(B, T)
 
         # advance the position in the tensor
 
-        self.current_positiion += self.B * self.T
+        self.current_position += self.B * self.T
 
         # if loading the next batch would go out of bounds, reset current position
-        if self.current_positiion + self.B * self.T + 1 >= len(self.tokens):
-            self.current_positiion = 0
+        if self.current_position + self.B * self.T + 1 >= len(self.tokens):
+            self.current_position = 0
 
         return x, y
 
@@ -250,9 +253,13 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 train_loader = DataloaderLite(B=16, T=1024)
+
+torch.set_float32_matmul_precision('high')
+
 # model
-model = GPT(GPT2Config())
+model = GPT(GPT2Config(vocab_size=50304)) #nice divisible number
 model.to(device)
+model = torch.compile(model)
 #logits, loss = model(x, y)
 
 # optimizer
@@ -263,7 +270,9 @@ for i in range(50):
     x, y = x.to(device), y.to(device)
 
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
+
     loss.backward()
     optimizer.step()
 
@@ -271,7 +280,8 @@ for i in range(50):
         torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0) * 1000
-    print(f"step {i+1}, loss {loss.item()}, time {dt} ms")
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(f"step {i+1}, loss {loss.item()}, time {dt} ms, tokens per sec {tokens_per_sec}")
 
 
 # skip sampling for now
