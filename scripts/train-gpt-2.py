@@ -10,7 +10,11 @@ import torch.nn as nn
 from torch.nn import functional as F
 import time
 
+import torch.distributed as dist
+
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+from torch.distributed import get_rank, get_world_size
 
 
 @dataclass
@@ -241,9 +245,11 @@ print(f"Using device: {device}")
 # dataloader
 
 class DataloaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, process_rank, num_processes):
         self.B = B
         self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
 
         with open('data/input.txt', 'r') as f:
             text = f.read()
@@ -256,7 +262,7 @@ class DataloaderLite:
         print(f"1 epoch = {len(tokens) // (B*T)} batches")
 
         #state
-        self.current_position = 0
+        self.current_position = self.process_rank * self.B * self.T
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -268,11 +274,11 @@ class DataloaderLite:
 
         # advance the position in the tensor
 
-        self.current_position += self.B * self.T
+        self.current_position += self.B * self.T * self.num_processes
 
         # if loading the next batch would go out of bounds, reset current position
-        if self.current_position + self.B * self.T + 1 >= len(self.tokens):
-            self.current_position = 0
+        if self.current_position + (self.B * self.T * self.num_processes) >= len(self.tokens):
+            self.current_position = self.B * self.T * self.process_rank
 
         return x, y
 
@@ -309,11 +315,7 @@ if master_process:
     print("total desired batch size:", total_batch_size)
     print("gradient accumulation steps:", grad_accum_steps)
 
-print(f"I'm gpu {ddp_local_rank}")
-print("bye")
-import sys; sys.exit()
-
-train_loader = DataloaderLite(B=16, T=1024)
+train_loader = DataloaderLite(B=16, T=1024, process_rank=ddp_rank, num_processes=ddp_world_size)
 
 torch.set_float32_matmul_precision('high')
 
@@ -321,7 +323,11 @@ torch.set_float32_matmul_precision('high')
 model = GPT(GPT2Config(vocab_size=50304)) #nice divisible number
 model.to(device)
 model = torch.compile(model)
-#logits, loss = model(x, y)
+
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model
+
 
 # learning rate scheduler
 max_lr = 6e-4
@@ -345,18 +351,28 @@ def get_learning_rate(it):
 
 
 # optimizer
-optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e4, betas=(0.9, 0.95), device=device)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e4, betas=(0.9, 0.95), device=device)
 
 for step in range(max_steps):
     t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
-
     optimizer.zero_grad()
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
+    loss_accum = 0.0
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
 
-    loss.backward()
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1) #ugly, but no context manager
+
+        loss.backward()
+
+    if ddp:
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # gradient norm clipping to prevent normal from being shocked
     lr = get_learning_rate(step)
 
@@ -369,9 +385,13 @@ for step in range(max_steps):
         torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0) * 1000
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
-    print(f"step {step+1:4d}| loss {loss.item():.6f}| LR {lr}| norm: {norm:.4f} | time {dt:.4f} ms | tokens per sec {tokens_per_sec:.2f}")
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
+    tokens_per_sec = tokens_processed / (t1 - t0)
+    if master_process:
+        print(f"step {step+1:4d}| loss {loss_accum.item():.6f}| LR {lr}| norm: {norm:.4f} | time {dt:.4f} ms | tokens per sec {tokens_per_sec:.2f}")
 
+if ddp:
+    dist.destroy_process_group()
 
 # skip sampling for now
 # print("Model successfully created")
