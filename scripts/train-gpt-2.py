@@ -311,6 +311,7 @@ if master_process:
 
 print(f"I'm gpu {ddp_local_rank}")
 print("bye")
+import sys; sys.exit()
 
 train_loader = DataloaderLite(B=16, T=1024)
 
