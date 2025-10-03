@@ -1,12 +1,16 @@
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+import os
 import tiktoken
 import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import time
+
+from torch.distributed import init_process_group, destroy_process_group
+
 
 @dataclass
 class GPT2Config:
@@ -247,10 +251,40 @@ class DataloaderLite:
         return x, y
 
 
+#set up DDP
+ddp = int(os.environ.get('RANK', -1)) != -1
+if ddp:
+    assert torch.cuda.is_available(), "DDP requires CUDA"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f"cuda:{ddp_local_rank}"
+    torch.cuda.set_device(ddp_local_rank)
+    master_process = ddp_rank == 0
+else:
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    master_process = True
+
 #reproducability
 torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
+
+total_batch_size = 524288
+B = 16
+T = 1024
+assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batchsize is divisible by B * T * ddp_world_size"
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+if master_process:
+    print("total desired batch size:", total_batch_size)
+    print("gradient accumulation steps:", grad_accum_steps)
+
+print(f"I'm gpu {ddp_local_rank}")
+print("bye")
 
 train_loader = DataloaderLite(B=16, T=1024)
 
