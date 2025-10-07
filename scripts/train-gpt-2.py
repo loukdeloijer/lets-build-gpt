@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import os
+import numpy as np
 import inspect
 import tiktoken
 import math
@@ -244,24 +245,32 @@ print(f"Using device: {device}")
 
 # dataloader
 
+def load_tokens(filename):
+     npt =  np.load(filename)
+     ptt = torch.tensor(npt, dtype=torch.long)
+     return ptt
+
 class DataloaderLite:
-    def __init__(self, B, T, process_rank, num_processes):
+    def __init__(self, B, T, process_rank, num_processes, split):
         self.B = B
         self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
+        assert split in ['train', 'val']
 
-        with open('data/input.txt', 'r') as f:
-            text = f.read()
+        data_root = "edu_fineweb10B"
+        shards = os.listdir(data_root)
+        shards = [s for s in shards if split in s]
+        shards = [os.path.join(data_root, s) for s in shards]
+        self.shards = shards
 
-        enc = tiktoken.get_encoding("gpt2")
-        tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens)
+        assert len(shards) > 0, "No shards found for split"
 
-        print(f"Loaded dataset with {len(self.tokens)} tokens")
-        print(f"1 epoch = {len(tokens) // (B*T)} batches")
+        if master_process:
+            print(f"Found {len(shards)} shards for split {split}")
 
-        #state
+        self.current_shard = 0
+        self.tokens = load_tokens(shards[self.current_shard])
         self.current_position = self.process_rank * self.B * self.T
 
     def next_batch(self):
@@ -269,8 +278,8 @@ class DataloaderLite:
 
         batch = self.tokens[self.current_position : self.current_position + self.B * self.T + 1]
 
-        x = batch[:-1].view(B, T)
-        y = batch[1:].view(B, T)
+        x = (batch[:-1]).view(B, T)
+        y = (batch[1:]).view(B, T)
 
         # advance the position in the tensor
 
@@ -278,6 +287,8 @@ class DataloaderLite:
 
         # if loading the next batch would go out of bounds, reset current position
         if self.current_position + (self.B * self.T * self.num_processes) >= len(self.tokens):
+            self.current_shard += 1
+            self.tokens = load_tokens(self.shards[self.current_shard])
             self.current_position = self.B * self.T * self.process_rank
 
         return x, y
@@ -307,7 +318,7 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 total_batch_size = 524288
-B = 16
+B = 16 # can increase to 64?
 T = 1024
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batchsize is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -315,7 +326,7 @@ if master_process:
     print("total desired batch size:", total_batch_size)
     print("gradient accumulation steps:", grad_accum_steps)
 
-train_loader = DataloaderLite(B=16, T=1024, process_rank=ddp_rank, num_processes=ddp_world_size)
+train_loader = DataloaderLite(B=16, T=1024, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
 
 torch.set_float32_matmul_precision('high')
 
@@ -332,8 +343,8 @@ raw_model = model.module if ddp else model
 # learning rate scheduler
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 10
-max_steps = 50
+warmup_steps = 715 # 373 million tokens / 524288 tokens per batch
+max_steps = 19073 # 10B tokens / 524288 tokens per batch
 
 def get_learning_rate(it):
     # linear warmup for warmup_iters steps
@@ -388,7 +399,7 @@ for step in range(max_steps):
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = tokens_processed / (t1 - t0)
     if master_process:
-        print(f"step {step+1:4d}| loss {loss_accum.item():.6f}| LR {lr}| norm: {norm:.4f} | time {dt:.4f} ms | tokens per sec {tokens_per_sec:.2f}")
+        print(f"step {step+1:4d}| loss {loss_accum:.6f}| LR {lr}| norm: {norm:.4f} | time {dt:.4f} ms | tokens per sec {tokens_per_sec:.2f}")
 
 if ddp:
     dist.destroy_process_group()
