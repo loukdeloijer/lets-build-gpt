@@ -12,6 +12,7 @@ from torch.nn import functional as F
 import time
 
 import torch.distributed as dist
+import wandb
 
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
@@ -243,6 +244,24 @@ max_length=30
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
 
+#set up DDP
+ddp = int(os.environ.get('RANK', -1)) != -1
+if ddp:
+    assert torch.cuda.is_available(), "DDP requires CUDA"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f"cuda:{ddp_local_rank}"
+    torch.cuda.set_device(ddp_local_rank)
+    master_process = ddp_rank == 0
+else:
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    master_process = True
+
 # dataloader
 
 def load_tokens(filename):
@@ -294,24 +313,6 @@ class DataloaderLite:
         return x, y
 
 
-#set up DDP
-ddp = int(os.environ.get('RANK', -1)) != -1
-if ddp:
-    assert torch.cuda.is_available(), "DDP requires CUDA"
-    init_process_group(backend='nccl')
-    ddp_rank = int(os.environ['RANK'])
-    ddp_local_rank = int(os.environ['LOCAL_RANK'])
-    ddp_world_size = int(os.environ['WORLD_SIZE'])
-    device = f"cuda:{ddp_local_rank}"
-    torch.cuda.set_device(ddp_local_rank)
-    master_process = ddp_rank == 0
-else:
-    ddp_rank = 0
-    ddp_local_rank = 0
-    ddp_world_size = 1
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    master_process = True
-
 #reproducability
 torch.manual_seed(1337)
 if torch.cuda.is_available():
@@ -327,6 +328,25 @@ if master_process:
     print("gradient accumulation steps:", grad_accum_steps)
 
 train_loader = DataloaderLite(B=16, T=1024, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
+
+if master_process:
+    wandb.init(
+        project="gpt2-training",
+        config={
+            "batch_size": B,
+            "sequence_length": T,
+            "total_batch_size": total_batch_size,
+            "grad_accum_steps": grad_accum_steps,
+            "max_lr": 6e-4,
+            "min_lr": 6e-5,
+            "warmup_steps": 715,
+            "max_steps": 19073,
+            "vocab_size": 50304,
+            "n_layer": 12,
+            "n_head": 12,
+            "n_embd": 768,
+        }
+    )
 
 torch.set_float32_matmul_precision('high')
 
@@ -400,6 +420,17 @@ for step in range(max_steps):
     tokens_per_sec = tokens_processed / (t1 - t0)
     if master_process:
         print(f"step {step+1:4d}| loss {loss_accum:.6f}| LR {lr}| norm: {norm:.4f} | time {dt:.4f} ms | tokens per sec {tokens_per_sec:.2f}")
+        wandb.log({
+            "loss": loss_accum.item(),
+            "learning_rate": lr,
+            "grad_norm": norm.item(),
+            "step_time_ms": dt,
+            "tokens_per_sec": tokens_per_sec,
+            "step": step
+        })
+
+if master_process:
+    wandb.finish()
 
 if ddp:
     dist.destroy_process_group()
