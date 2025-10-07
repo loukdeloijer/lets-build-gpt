@@ -288,8 +288,11 @@ class DataloaderLite:
         if master_process:
             print(f"Found {len(shards)} shards for split {split}")
 
+        self.reset()
+
+    def reset(self):
         self.current_shard = 0
-        self.tokens = load_tokens(shards[self.current_shard])
+        self.tokens = load_tokens(self.shards[self.current_shard])
         self.current_position = self.process_rank * self.B * self.T
 
     def next_batch(self):
@@ -421,7 +424,7 @@ for step in range(max_steps):
     if master_process:
         print(f"step {step+1:4d}| loss {loss_accum:.6f}| LR {lr}| norm: {norm:.4f} | time {dt:.4f} ms | tokens per sec {tokens_per_sec:.2f}")
         wandb.log({
-            "loss": loss_accum.item(),
+            "loss": loss_accum,
             "learning_rate": lr,
             "grad_norm": norm.item(),
             "step_time_ms": dt,
