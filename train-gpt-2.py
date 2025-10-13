@@ -3,7 +3,6 @@
 import os
 import numpy as np
 import inspect
-import tiktoken
 import math
 import torch
 import torch.nn as nn
@@ -11,15 +10,12 @@ from torch.nn import functional as F
 import time
 
 import torch.distributed as dist
-import wandb
-import tiktoken
 from dataclasses import dataclass
 
 from hellaswag import iterate_examples, render_example
 
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
-from torch.distributed import get_rank, get_world_size
 
 
 @dataclass
@@ -240,44 +236,20 @@ class GPT(nn.Module):
 
         return optimizer
 
-num_return_sequences=5
-max_length=30
-
-# device
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"Using device: {device}")
-
-#set up DDP
-ddp = int(os.environ.get('RANK', -1)) != -1
-if ddp:
-    assert torch.cuda.is_available(), "DDP requires CUDA"
-    init_process_group(backend='nccl')
-    ddp_rank = int(os.environ['RANK'])
-    ddp_local_rank = int(os.environ['LOCAL_RANK'])
-    ddp_world_size = int(os.environ['WORLD_SIZE'])
-    device = f"cuda:{ddp_local_rank}"
-    torch.cuda.set_device(ddp_local_rank)
-    master_process = ddp_rank == 0
-else:
-    ddp_rank = 0
-    ddp_local_rank = 0
-    ddp_world_size = 1
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    master_process = True
-
 # dataloader
 
-def load_tokens(filename):
-     npt =  np.load(filename)
-     ptt = torch.tensor(npt, dtype=torch.long)
-     return ptt
+def load_tokens(filename: str) -> torch.Tensor:
+    npt = np.load(filename)
+    return torch.tensor(npt, dtype=torch.long)
+
 
 class DataloaderLite:
-    def __init__(self, B, T, process_rank, num_processes, split):
+    def __init__(self, B, T, process_rank, num_processes, split, master_process):
         self.B = B
         self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
+        self.master_process = master_process
         assert split in ['train', 'val']
 
         data_root = "edu_fineweb10B"
@@ -288,7 +260,7 @@ class DataloaderLite:
 
         assert len(shards) > 0, "No shards found for split"
 
-        if master_process:
+        if self.master_process:
             print(f"Found {len(shards)} shards for split {split}")
 
         self.reset()
@@ -306,11 +278,8 @@ class DataloaderLite:
         x = (batch[:-1]).view(B, T)
         y = (batch[1:]).view(B, T)
 
-        # advance the position in the tensor
-
         self.current_position += self.B * self.T * self.num_processes
 
-        # if loading the next batch would go out of bounds, reset current position
         if self.current_position + (self.B * self.T * self.num_processes) >= len(self.tokens):
             self.current_shard += 1
             self.tokens = load_tokens(self.shards[self.current_shard])
@@ -324,256 +293,254 @@ def get_most_likely_row(tokens: torch.Tensor, mask: torch.Tensor, logits: torch.
     helper function for HellaSwag eval
     takes tokens, mask, and logits, returns the index of the completion with the lowest loss
     """
-    # Shift logits and tokens to align predictions with targets
-    # logits[i] predicts tokens[i+1]
-    pred_logits = logits[..., :-1, :].contiguous()  # predictions (all but last position)
-    target_tokens = tokens[..., 1:].contiguous()     # targets (all but first position)
+    pred_logits = logits[..., :-1, :].contiguous()
+    target_tokens = tokens[..., 1:].contiguous()
 
-    # Compute per-token cross-entropy loss
     flat_logits = pred_logits.view(-1, pred_logits.size(-1))
     flat_targets = target_tokens.view(-1)
     token_losses = F.cross_entropy(flat_logits, flat_targets, reduction='none')
-    token_losses = token_losses.view(tokens.size(0), -1)  # reshape back to [batch, seq_len-1]
+    token_losses = token_losses.view(tokens.size(0), -1)
 
-    # Apply mask to compute loss only on completion tokens (mask==1)
-    completion_mask = mask[..., 1:].contiguous()  # shift mask to align with targets
+    completion_mask = mask[..., 1:].contiguous()
     masked_losses = token_losses * completion_mask
 
-    # Average loss over completion tokens only
     avg_loss = masked_losses.sum(dim=1) / completion_mask.sum(dim=1)
 
-    # Return the index of the completion with the lowest loss
     best_completion_idx = avg_loss.argmin().item()
     return best_completion_idx
 
 
+#set up DDP
 
-#reproducability
-torch.manual_seed(1337)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(1337)
+def main() -> None:
+    import tiktoken
+    import wandb
 
-enc = tiktoken.get_encoding("gpt2")
+    num_return_sequences = 5
+    max_length = 30
 
-total_batch_size = 524288
-B = 16 # can increase to 64?
-T = 1024
-assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batchsize is divisible by B * T * ddp_world_size"
-grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
-if master_process:
-    print("total desired batch size:", total_batch_size)
-    print("gradient accumulation steps:", grad_accum_steps)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
 
-train_loader = DataloaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train")
-val_loader = DataloaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val")
+    ddp = int(os.environ.get('RANK', -1)) != -1
+    if ddp:
+        assert torch.cuda.is_available(), "DDP requires CUDA"
+        init_process_group(backend='nccl')
+        ddp_rank = int(os.environ['RANK'])
+        ddp_local_rank = int(os.environ['LOCAL_RANK'])
+        ddp_world_size = int(os.environ['WORLD_SIZE'])
+        device = f"cuda:{ddp_local_rank}"
+        torch.cuda.set_device(ddp_local_rank)
+        master_process = ddp_rank == 0
+    else:
+        ddp_rank = 0
+        ddp_local_rank = 0
+        ddp_world_size = 1
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        master_process = True
 
-if master_process:
-    wandb.init(
-        project="gpt2-training",
-        config={
-            "batch_size": B,
-            "sequence_length": T,
-            "total_batch_size": total_batch_size,
-            "grad_accum_steps": grad_accum_steps,
-            "max_lr": 6e-4,
-            "min_lr": 6e-5,
-            "warmup_steps": 715,
-            "max_steps": 19073,
-            "vocab_size": 50304,
-            "n_layer": 12,
-            "n_head": 12,
-            "n_embd": 768,
-        }
-    )
+    torch.manual_seed(1337)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(1337)
 
-torch.set_float32_matmul_precision('high')
+    enc = tiktoken.get_encoding("gpt2")
 
-# model
-model = GPT(GPT2Config(vocab_size=50304)) #nice divisible number
-model.to(device)
-model = torch.compile(model)
+    total_batch_size = 524288
+    B = 16  # can increase to 64?
+    T = 1024
+    assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batchsize is divisible by B * T * ddp_world_size"
+    grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+    if master_process:
+        print("total desired batch size:", total_batch_size)
+        print("gradient accumulation steps:", grad_accum_steps)
 
-if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
-raw_model = model.module if ddp else model
+    train_loader = DataloaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="train", master_process=master_process)
+    val_loader = DataloaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split="val", master_process=master_process)
 
+    if master_process:
+        wandb.init(
+            project="gpt2-training",
+            config={
+                "batch_size": B,
+                "sequence_length": T,
+                "total_batch_size": total_batch_size,
+                "grad_accum_steps": grad_accum_steps,
+                "max_lr": 6e-4,
+                "min_lr": 6e-5,
+                "warmup_steps": 715,
+                "max_steps": 19073,
+                "vocab_size": 50304,
+                "n_layer": 12,
+                "n_head": 12,
+                "n_embd": 768,
+            }
+        )
 
-# learning rate scheduler
-max_lr = 6e-4
-min_lr = max_lr * 0.1
-warmup_steps = 715 # 373 million tokens / 524288 tokens per batch
-max_steps = 19073 # 10B tokens / 524288 tokens per batch
+    torch.set_float32_matmul_precision('high')
 
-def get_learning_rate(it):
-    # linear warmup for warmup_iters steps
-    if it < warmup_steps:
-        return max_lr * (it+1) / warmup_steps
+    model = GPT(GPT2Config(vocab_size=50304))  # nice divisible number
+    model.to(device)
+    model = torch.compile(model)
 
+    if ddp:
+        model = DDP(model, device_ids=[ddp_local_rank])
+    raw_model = model.module if ddp else model
 
-    if it > max_steps:
-        return min_lr
+    max_lr = 6e-4
+    min_lr = max_lr * 0.1
+    warmup_steps = 715  # 373 million tokens / 524288 tokens per batch
+    max_steps = 19073  # 10B tokens / 524288 tokens per batch
 
-    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 +math.cos(math.pi + decay_ratio))
-    return min_lr + coeff * (max_lr - min_lr)
+    def get_learning_rate(it):
+        if it < warmup_steps:
+            return max_lr * (it + 1) / warmup_steps
 
+        if it > max_steps:
+            return min_lr
 
-# optimizer
-optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e4, betas=(0.9, 0.95), device=device)
+        decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+        assert 0 <= decay_ratio <= 1
+        coeff = 0.5 * (1.0 + math.cos(math.pi + decay_ratio))
+        return min_lr + coeff * (max_lr - min_lr)
 
-# log dir
-checkpoint_dir = "checkpoints"
-os.makedirs(checkpoint_dir, exist_ok=True)
+    optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e4, betas=(0.9, 0.95), device=device)
 
-for step in range(max_steps):
-    t0 = time.time()
-    last_step = (step == max_steps - 1)
+    checkpoint_dir = "checkpoints"
+    os.makedirs(checkpoint_dir, exist_ok=True)
 
-    # evaluate val loss every 100 steps
-    if step % 100 == 0 or last_step:
-        model.eval()
-        with torch.no_grad():
-            val_loss_accum = 0.0
-            val_steps = 20
-            for _ in range(val_steps):
-                x, y = val_loader.next_batch()
-                x, y = x.to(device), y.to(device)
-                with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                    logits, loss = model(x, y)
-                loss = loss / val_steps
-                val_loss_accum += loss.detach()
+    for step in range(max_steps):
+        t0 = time.time()
+        last_step = (step == max_steps - 1)
+
+        if step % 100 == 0 or last_step:
+            model.eval()
+            with torch.no_grad():
+                val_loss_accum = 0.0
+                val_steps = 20
+                for _ in range(val_steps):
+                    x, y = val_loader.next_batch()
+                    x, y = x.to(device), y.to(device)
+                    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                        logits, loss = model(x, y)
+                    loss = loss / val_steps
+                    val_loss_accum += loss.detach()
+                if ddp:
+                    dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+
+                if master_process:
+                    print(f"step {step+1:4d}| val loss {val_loss_accum:.6f}")
+                    wandb.log({
+                        "val/val_loss": val_loss_accum,
+                        "step": step
+                    })
+                    if step > 0 and (step % 5000 == 0 or last_step):
+                        torch.save(model.state_dict(), f"{checkpoint_dir}/model-step-{step}.pth")
+
+        if (step % 250 == 0 or last_step):
+            num_correct_norm = 0
+            num_total = 0
+            for i, example in enumerate(iterate_examples("val")):
+                if i % ddp_world_size != ddp_rank:
+                    continue
+                _, tokens, mask, label = render_example(example)
+                tokens = tokens.to(device)
+                mask = mask.to(device)
+                with torch.no_grad():
+                    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                        logits, loss = model(tokens)
+                    pred_norm = get_most_likely_row(tokens, mask, logits)
+                num_total += 1
+                num_correct_norm += int(pred_norm == label)
             if ddp:
-                dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
-
+                num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+                num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+                dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
+                dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
+                num_total = num_total.item()
+                num_correct_norm = num_correct_norm.item()
+            acc_norm = num_correct_norm / num_total
             if master_process:
-                print(f"step {step+1:4d}| val loss {val_loss_accum:.6f}")
+                print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
                 wandb.log({
-                    "val/val_loss": val_loss_accum,
+                    "hella_swag_accuracy": acc_norm,
                     "step": step
                 })
-                if step > 0 and (step % 5000 == 0 or last_step):
-                # optionally write model checkpoints
-                    torch.save(model.state_dict(), f"{checkpoint_dir}/model-step-{step}.pth")
 
-    # eval hellaswag
-    if (step % 250 == 0 or last_step):
-        num_correct_norm = 0
-        num_total = 0
-        for i, example in enumerate(iterate_examples("val")):
-            # only process examples where i % ddp_world_size == ddp_rank
-            if i % ddp_world_size != ddp_rank:
-                continue
-            # render the example into tokens and labels
-            _, tokens, mask, label = render_example(example)
-            tokens = tokens.to(device)
-            mask = mask.to(device)
-            # get the logits
-            with torch.no_grad():
-                with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                    logits, loss = model(tokens)
-                pred_norm = get_most_likely_row(tokens, mask, logits)
-            num_total += 1
-            num_correct_norm += int(pred_norm == label)
-        # reduce the stats across all processes
+        if ((step > 0 and step % 250 == 0) or last_step):
+            model.eval()
+            num_return_sequences = 4
+            max_length = 32
+            tokens = enc.encode("Hello, I'm a language model,")
+            tokens = torch.tensor(tokens, dtype=torch.long)
+            tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+            xgen = tokens.to(device)
+            sample_rng = torch.Generator(device=device)
+            sample_rng.manual_seed(42 + ddp_rank)
+            while xgen.size(1) < max_length:
+                with torch.no_grad():
+                    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                        logits, loss = model(xgen)
+                    logits = logits[:, -1, :]
+                    probs = F.softmax(logits, dim=-1)
+                    topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+                    ix = torch.multinomial(topk_probs, 1, generator=sample_rng)
+                    xcol = torch.gather(topk_indices, -1, ix)
+                    xgen = torch.cat((xgen, xcol), dim=1)
+            for i in range(num_return_sequences):
+                tokens = xgen[i, :max_length].tolist()
+                decoded = enc.decode(tokens)
+                print(f"rank {ddp_rank} sample {i}: {decoded}")
+
+        model.train()
+        optimizer.zero_grad()
+        loss_accum = 0.0
+        for micro_step in range(grad_accum_steps):
+            x, y = train_loader.next_batch()
+            x, y = x.to(device), y.to(device)
+            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                logits, loss = model(x, y)
+
+            loss = loss / grad_accum_steps
+            loss_accum += loss.detach()
+            if ddp:
+                model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1) #ugly, but no context manager
+
+            loss.backward()
+
         if ddp:
-            num_total = torch.tensor(num_total, dtype=torch.long, device=device)
-            num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
-            dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
-            dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
-            num_total = num_total.item()
-            num_correct_norm = num_correct_norm.item()
-        acc_norm = num_correct_norm / num_total
+            dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # gradient norm clipping to prevent normal from being shocked
+        lr = get_learning_rate(step)
+
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+
+        optimizer.step()
+
+        if device == "cuda":
+            torch.cuda.synchronize()
+        t1 = time.time()
+        dt = (t1 - t0) * 1000
+        tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
+        tokens_per_sec = tokens_processed / (t1 - t0)
         if master_process:
-            print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+            print(f"step {step+1:4d}| loss {loss_accum:.6f}| LR {lr}| norm: {norm:.4f} | time {dt:.4f} ms | tokens per sec {tokens_per_sec:.2f}")
             wandb.log({
-                "hella_swag_accuracy": acc_norm,
+                "loss": loss_accum,
+                "learning_rate": lr,
+                "grad_norm": norm.item(),
+                "step_time_ms": dt,
+                "tokens_per_sec": tokens_per_sec,
                 "step": step
             })
 
-    # once in a while generate samples
-    if ((step > 0 and step % 250 == 0) or last_step):
-
-        model.eval()
-        num_return_sequences = 4
-        max_length = 32
-        tokens = enc.encode("Hello, I'm a language model,")
-        tokens = torch.tensor(tokens, dtype=torch.long)
-        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-        xgen = tokens.to(device)
-        sample_rng = torch.Generator(device=device)
-        sample_rng.manual_seed(42 + ddp_rank)
-        while xgen.size(1) < max_length:
-            # forward the model to get the logits
-            with torch.no_grad():
-                with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                    logits, loss = model(xgen) # (B, T, vocab_size)
-                # take the logits at the last position
-                logits = logits[:, -1, :] # (B, vocab_size)
-                # get the probabilities
-                probs = F.softmax(logits, dim=-1)
-                # do top-k sampling of 50 (huggingface pipeline default)
-                # topk_probs here becomes (5, 50), topk_indices is (5, 50)
-                topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-                # select a token from the top-k probabilities
-                # note: multinomial does not demand the input to sum to 1
-                ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
-                # gather the corresponding indices
-                xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
-                # append to the sequence
-                xgen = torch.cat((xgen, xcol), dim=1)
-        # print the generated text
-        for i in range(num_return_sequences):
-            tokens = xgen[i, :max_length].tolist()
-            decoded = enc.decode(tokens)
-            print(f"rank {ddp_rank} sample {i}: {decoded}")
-
-    model.train()
-    optimizer.zero_grad()
-    loss_accum = 0.0
-    for micro_step in range(grad_accum_steps):
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
-        with torch.autocast(device_type=device, dtype=torch.bfloat16):
-            logits, loss = model(x, y)
-
-        loss = loss / grad_accum_steps
-        loss_accum += loss.detach()
-        if ddp:
-            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1) #ugly, but no context manager
-
-        loss.backward()
+    if master_process:
+        wandb.finish()
 
     if ddp:
-        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+        destroy_process_group()
 
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # gradient norm clipping to prevent normal from being shocked
-    lr = get_learning_rate(step)
 
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-
-    optimizer.step()
-
-    if device == "cuda":
-        torch.cuda.synchronize()
-    t1 = time.time()
-    dt = (t1 - t0) * 1000
-    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
-    tokens_per_sec = tokens_processed / (t1 - t0)
-    if master_process:
-        print(f"step {step+1:4d}| loss {loss_accum:.6f}| LR {lr}| norm: {norm:.4f} | time {dt:.4f} ms | tokens per sec {tokens_per_sec:.2f}")
-        wandb.log({
-            "loss": loss_accum,
-            "learning_rate": lr,
-            "grad_norm": norm.item(),
-            "step_time_ms": dt,
-            "tokens_per_sec": tokens_per_sec,
-            "step": step
-        })
-
-if master_process:
-    wandb.finish()
-
-if ddp:
-    dist.destroy_process_group()
+if __name__ == "__main__":
+    main()
