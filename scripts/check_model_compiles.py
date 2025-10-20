@@ -2,12 +2,16 @@
 
 from importlib import util
 from pathlib import Path
+import sys
 
 import torch
 
 
 def load_model_module():
     repo_root = Path(__file__).resolve().parents[1]
+    repo_root_str = str(repo_root)
+    if repo_root_str not in sys.path:
+        sys.path.insert(0, repo_root_str)
     module_path = repo_root / "train-gpt-2.py"
     spec = util.spec_from_file_location("train_gpt_2", module_path)
     if spec is None or spec.loader is None:

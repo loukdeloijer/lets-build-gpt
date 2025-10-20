@@ -1,0 +1,9 @@
+repos:
+  - repo: local
+    hooks:
+      - id: gpt-compile-check
+        name: Ensure GPT model compiles
+        entry: uv run --frozen python scripts/check_model_compiles.py
+        language: system
+        pass_filenames: false
+        always_run: true

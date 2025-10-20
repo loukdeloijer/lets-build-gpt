@@ -12,8 +12,6 @@ import time
 import torch.distributed as dist
 from dataclasses import dataclass
 
-from hellaswag import iterate_examples, render_example
-
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
@@ -437,6 +435,8 @@ def main() -> None:
                         torch.save(model.state_dict(), f"{checkpoint_dir}/model-step-{step}.pth")
 
         if (step % 250 == 0 or last_step):
+            from hellaswag import iterate_examples, render_example
+
             num_correct_norm = 0
             num_total = 0
             for i, example in enumerate(iterate_examples("val")):
