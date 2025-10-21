@@ -207,10 +207,18 @@ class StreamingTokenLoader:
 def load_streaming_split(config: TrainingConfig, split: str) -> IterableDataset:
     """Load a streaming dataset split, handling optional config names."""
 
-    load_kwargs = {"split": split, "streaming": True}
+    load_kwargs = {"split": "train", "streaming": True}
     if config.dataset_config:
-        return load_dataset(config.dataset_name, name=config.dataset_config, **load_kwargs)
-    return load_dataset(config.dataset_name, **load_kwargs)
+        dataset = load_dataset(config.dataset_name, config.dataset_config, **load_kwargs)
+    else:
+        dataset = load_dataset(config.dataset_name, **load_kwargs)
+
+    if split == "train[1024:]":
+        dataset = dataset.skip(1024)
+    elif split == "train[:1024]":
+        dataset = dataset.take(1024)
+
+    return dataset
 
 
 def get_most_likely_row(tokens: torch.Tensor, mask: torch.Tensor, logits: torch.Tensor) -> int:
