@@ -3,14 +3,17 @@ from __future__ import annotations
 
 import math
 import os
+import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
+from queue import Queue
 from typing import Dict, Iterable, Tuple
 
-import numpy as np
 import torch
 import torch.distributed as dist
+from datasets import IterableDataset, load_dataset
 from torch import nn
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -27,7 +30,6 @@ class TrainingConfig:
     """Hyperparameters and runtime configuration for GPT-2 training."""
 
     project: str = "gpt2-training"
-    data_root: Path = field(default_factory=lambda: Path("edu_fineweb10B"))
     checkpoint_dir: Path = field(default_factory=lambda: Path("checkpoints"))
     total_batch_size: int = 524_288
     micro_batch_size: int = 16
@@ -51,10 +53,15 @@ class TrainingConfig:
     hellaswag_split: str = "val"
     use_compile: bool = True
     model: GPT2Config = field(default_factory=lambda: GPT2Config(vocab_size=50_304))
+    dataset_name: str = "HuggingFaceFW/fineweb-edu"
+    dataset_config: str = "sample-10BT"
+    train_split: str = "train[1024:]"
+    val_split: str = "train[:1024]"
+    dataset_text_field: str = "text"
+    shuffle_buffer_size: int = 10_000
+    prefetch_batches: int = 4
 
     def __post_init__(self) -> None:
-        if isinstance(self.data_root, str):
-            self.data_root = Path(self.data_root)
         if isinstance(self.checkpoint_dir, str):
             self.checkpoint_dir = Path(self.checkpoint_dir)
         if self.model.block_size != self.block_size:
@@ -113,69 +120,105 @@ def setup_distributed() -> Tuple[bool, int, int, int, torch.device, bool]:
     return ddp, ddp_rank, ddp_local_rank, ddp_world_size, device, master_process
 
 
-def load_tokens(filename: Path) -> torch.Tensor:
-    """Load token ids from disk."""
-
-    tokens = np.load(str(filename), allow_pickle=False)
-    return torch.tensor(tokens, dtype=torch.long)
-
-
-class DataloaderLite:
-    """Minimalistic dataloader that iterates over pre-tokenised shards."""
+class StreamingTokenLoader:
+    """Stream token batches from a Hugging Face dataset."""
 
     def __init__(
         self,
+        dataset: IterableDataset,
+        encoding: tiktoken.Encoding,
+        text_field: str,
         batch_size: int,
         block_size: int,
         process_rank: int,
         num_processes: int,
-        split: str,
-        data_root: Path,
-        master_process: bool,
+        shuffle: bool,
+        shuffle_buffer_size: int,
+        seed: int,
+        prefetch_batches: int,
     ) -> None:
-        if split not in {"train", "val"}:
-            raise ValueError("split must be 'train' or 'val'")
+        if shuffle:
+            dataset = dataset.shuffle(seed=seed, buffer_size=shuffle_buffer_size)
+        if num_processes > 1:
+            dataset = dataset.shard(num_shards=num_processes, index=process_rank)
 
+        self.dataset = dataset
+        self.dataset_iter = iter(self.dataset)
+        self.encoding = encoding
+        self.text_field = text_field
         self.batch_size = batch_size
         self.block_size = block_size
-        self.process_rank = process_rank
-        self.num_processes = num_processes
-        self.master_process = master_process
+        self.tokens_per_batch = batch_size * block_size
+        self.eot_token = encoding._special_tokens["<|endoftext|>"]
+        self.buffer: deque[int] = deque()
+        self.queue: Queue[Tuple[torch.Tensor, torch.Tensor]] | None = None
+        self._prefetch_thread: threading.Thread | None = None
 
-        shards = sorted(data_root.glob(f"*{split}*"))
-        if not shards:
-            raise FileNotFoundError(f"No shards found for split '{split}' in {data_root}.")
+        if prefetch_batches > 0:
+            self.queue = Queue(maxsize=prefetch_batches)
+            self._prefetch_thread = threading.Thread(
+                target=self._prefetch_loop, args=(prefetch_batches,), daemon=True
+            )
+            self._prefetch_thread.start()
 
-        self.shards = shards
-        if self.master_process:
-            print(f"Found {len(self.shards)} shards for split {split}")
+    def _prefetch_loop(self, warmup: int) -> None:
+        if self.queue is None:
+            return
+        for _ in range(warmup):
+            self.queue.put(self._prepare_batch())
+        while True:
+            self.queue.put(self._prepare_batch())
 
-        self.current_shard = 0
-        self.tokens = load_tokens(self.shards[self.current_shard])
-        self.current_position = self.process_rank * self.batch_size * self.block_size
+    def _next_dataset_item(self) -> Dict[str, str]:
+        while True:
+            try:
+                item = next(self.dataset_iter)
+            except StopIteration:
+                self.dataset_iter = iter(self.dataset)
+                continue
+            if isinstance(item, dict) and self.text_field in item:
+                return item
 
-    def _advance_shard(self) -> None:
-        self.current_shard = (self.current_shard + 1) % len(self.shards)
-        if self.current_shard == 0:
-            np.random.shuffle(self.shards)
-        self.tokens = load_tokens(self.shards[self.current_shard])
-        self.current_position = self.process_rank * self.batch_size * self.block_size
+    def _prepare_batch(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        needed = self.tokens_per_batch + 1
+        while len(self.buffer) < needed:
+            item = self._next_dataset_item()
+            text = item[self.text_field]
+            if not isinstance(text, str):
+                continue
+            tokens = [self.eot_token]
+            tokens.extend(self.encoding.encode_ordinary(text))
+            if len(tokens) <= 1:
+                continue
+            self.buffer.extend(tokens)
+
+        token_values = [self.buffer.popleft() for _ in range(needed)]
+        token_tensor = torch.tensor(token_values, dtype=torch.long)
+        x = token_tensor[:-1].view(self.batch_size, self.block_size)
+        y = token_tensor[1:].view(self.batch_size, self.block_size)
+        return x, y
 
     def next_batch(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        total_tokens = self.batch_size * self.block_size
-        batch = self.tokens[self.current_position : self.current_position + total_tokens + 1]
-        if batch.numel() < total_tokens + 1:
-            self._advance_shard()
-            batch = self.tokens[self.current_position : self.current_position + total_tokens + 1]
+        if self.queue is not None:
+            return self.queue.get()
+        return self._prepare_batch()
 
-        x = batch[:-1].view(self.batch_size, self.block_size)
-        y = batch[1:].view(self.batch_size, self.block_size)
 
-        self.current_position += total_tokens * self.num_processes
-        if self.current_position + (total_tokens * self.num_processes) >= len(self.tokens):
-            self._advance_shard()
+def load_streaming_split(config: TrainingConfig, split: str) -> IterableDataset:
+    """Load a streaming dataset split, handling optional config names."""
 
-        return x, y
+    load_kwargs = {"split": "train", "streaming": True}
+    if config.dataset_config:
+        dataset = load_dataset(config.dataset_name, config.dataset_config, **load_kwargs)
+    else:
+        dataset = load_dataset(config.dataset_name, **load_kwargs)
+
+    if split == "train[1024:]":
+        dataset = dataset.skip(1024)
+    elif split == "train[:1024]":
+        dataset = dataset.take(1024)
+
+    return dataset
 
 
 def get_most_likely_row(tokens: torch.Tensor, mask: torch.Tensor, logits: torch.Tensor) -> int:
@@ -202,7 +245,7 @@ def evaluate_train_loss(loss_accum: torch.Tensor) -> float:
 
 def evaluate_validation_loss(
     model: nn.Module,
-    loader: DataloaderLite,
+    loader: StreamingTokenLoader,
     device: torch.device,
     val_steps: int,
     ddp: bool,
@@ -330,23 +373,34 @@ def main() -> None:
 
     enc = tiktoken.get_encoding("gpt2")
 
-    train_loader = DataloaderLite(
+    train_dataset = load_streaming_split(config, config.train_split)
+    val_dataset = load_streaming_split(config, config.val_split)
+
+    train_loader = StreamingTokenLoader(
+        dataset=train_dataset,
+        encoding=enc,
+        text_field=config.dataset_text_field,
         batch_size=config.micro_batch_size,
         block_size=config.block_size,
         process_rank=ddp_rank,
         num_processes=ddp_world_size,
-        split="train",
-        data_root=config.data_root,
-        master_process=master_process,
+        shuffle=True,
+        shuffle_buffer_size=config.shuffle_buffer_size,
+        seed=config.seed,
+        prefetch_batches=config.prefetch_batches,
     )
-    val_loader = DataloaderLite(
+    val_loader = StreamingTokenLoader(
+        dataset=val_dataset,
+        encoding=enc,
+        text_field=config.dataset_text_field,
         batch_size=config.micro_batch_size,
         block_size=config.block_size,
         process_rank=ddp_rank,
         num_processes=ddp_world_size,
-        split="val",
-        data_root=config.data_root,
-        master_process=master_process,
+        shuffle=False,
+        shuffle_buffer_size=0,
+        seed=config.seed,
+        prefetch_batches=0,
     )
 
     torch.set_float32_matmul_precision("high")
