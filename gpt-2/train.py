@@ -30,7 +30,7 @@ class TrainingConfig:
     data_root: Path = field(default_factory=lambda: Path("edu_fineweb10B"))
     checkpoint_dir: Path = field(default_factory=lambda: Path("checkpoints"))
     total_batch_size: int = 524_288
-    micro_batch_size: int = 16
+    micro_batch_size: int = 64
     block_size: int = 1_024
     max_steps: int = 19_073
     warmup_steps: int = 715
