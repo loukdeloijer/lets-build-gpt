@@ -15,7 +15,7 @@ from torch.nn import functional as F
 class GPT2Config:
     """Configuration for the GPT-2 model."""
 
-    vocab_size: int = 50_257
+    vocab_size: int = 50304
     block_size: int = 1_024
     n_layer: int = 12
     n_head: int = 12
@@ -150,7 +150,7 @@ class GPT(nn.Module):
             "gpt2-large": {"n_layer": 36, "n_head": 20, "n_embd": 1_280},
             "gpt2-xl": {"n_layer": 48, "n_head": 25, "n_embd": 1_600},
         }[model_name]
-        config_args["vocab_size"] = 50_257
+        config_args["vocab_size"] = 50_304
         config_args["block_size"] = 1_024
 
         config = GPT2Config(**config_args)
